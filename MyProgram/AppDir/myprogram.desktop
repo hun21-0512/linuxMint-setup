@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=MyProgram
-Comment=System Information Utility
-Exec=myprogram
+Comment=시스템 설치 도우미
+Exec=AppRun
 Icon=myprogram
 Terminal=false
 Type=Application

@@ -1,194 +1,197 @@
 #!/bin/bash
 
-# 스크립트 위치 기준으로 작업 디렉터리 설정
-cd "$(dirname "$(readlink -f "$0")")" || exit 1
-
-# PATH 보정
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-
-# 오류 로그 저장
-exec 2>> /tmp/zenity_debug.log
-
-echo "========================"
-echo "실행 시간: $(date)"
-echo "사용자: $USER"
-echo "DISPLAY: $DISPLAY"
-echo "WAYLAND_DISPLAY: $WAYLAND_DISPLAY"
-echo "========================"
-
-# 필수 명령어 확인
-for CMD in zenity uname linux-version; do
-    if ! command -v "$CMD" >/dev/null 2>&1; then
-        zenity --error --text="$CMD 명령어를 찾을 수 없습니다." 2>/dev/null
-        exit 1
-    fi
-done
-
-#!/bin/bash
-
-# =====================================
-# 1. 커널 버전 검사
-# =====================================
+set -o pipefail
 
 MIN_KERNEL="4.15.0-20-generic"
 CURRENT_KERNEL=$(uname -r)
+APP_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/myprogram"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/myprogram"
+LOG_FILE="$LOG_DIR/install.log"
+MODEL_NAME="qwen2-1.5b-instruct-q4_k_m.gguf"
+MODEL_URL="https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf"
 
-if ! command -v linux-version >/dev/null 2>&1; then
-    zenity --error \
-        --title="시스템 오류" \
-        --text="linux-version 명령어를 찾을 수 없습니다."
+mkdir -p "$APP_HOME" "$LOG_DIR" || exit 1
+exec 2>>"$LOG_FILE"
+
+if ! command -v zenity >/dev/null 2>&1; then
+    printf 'Zenity is unavailable. Rebuild the AppImage with its GTK runtime dependencies.\n' >&2
     exit 1
 fi
 
-if ! linux-version compare "$CURRENT_KERNEL" ge "$MIN_KERNEL"; then
-    zenity --error \
-        --title="커널 버전 확인" \
-        --text="현재 커널 버전이 요구 조건에 미달합니다.\n\n현재 버전: $CURRENT_KERNEL\n요구 버전: $MIN_KERNEL 이상"
+if ! dpkg --compare-versions "$CURRENT_KERNEL" ge "$MIN_KERNEL"; then
+    zenity --error --title="커널 버전 확인" --no-markup \
+        --text="현재 커널은 이 프로그램의 최소 요구 조건을 충족하지 않습니다.\n\n현재 버전: $CURRENT_KERNEL\n요구 버전: $MIN_KERNEL 이상"
     exit 1
 fi
 
-# =====================================
-# 2. 체크박스 선택
-# =====================================
+run_step() {
+    local title="$1"
+    shift
 
-if ! CHECK=$(zenity --list \
-    --checklist \
-    --title="항목 선택" \
-    --text="실행할 항목을 선택하세요.\n커널 버전: $CURRENT_KERNEL" \
-    --width=600 \
-    --height=400 \
-    --column="선택" \
-    --column="항목                     " \
-    --column="설명                     " \
-    FALSE "구형llama 설치" "로컬 AI모델(qwen2-1.5b-instruct-q4_k_m)을 설치합니다" \
-    FALSE "barrier 설치" "2대 이상의 pc를 제어하는 프로그램을 설치합니다" \
-    FALSE "가상메모리 확장" "pc의 가상메모리를 확장합니다" \
-    --separator=","); then
+    if (
+        printf '# %s\n' "$title"
+        if "$@" >>"$LOG_FILE" 2>&1; then
+            printf '100\n'
+        else
+            exit "$?"
+        fi
+    ) | zenity --progress --title="진행 중" --text="$title" --pulsate --no-cancel --auto-close --width=420; then
+        return 0
+    fi
 
+    local details
+    details=$(tail -n 30 "$LOG_FILE" 2>/dev/null)
+    zenity --error --title="작업 실패" --no-markup \
+        --text="$title 작업에 실패했습니다.\n\n로그: $LOG_FILE\n\n$details"
+    return 1
+}
+
+selection_has() {
+    grep -Fxq -- "$1" <<< "$SELECTION"
+}
+
+install_build_tools() {
+    pkexec bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git curl ca-certificates'
+}
+
+fetch_llama_source() {
+    local source_dir="$APP_HOME/llama.cpp"
+    if [[ -d "$source_dir/.git" ]]; then
+        git -C "$source_dir" pull --ff-only
+    else
+        git clone https://github.com/ggml-org/llama.cpp.git "$source_dir"
+    fi
+}
+
+build_llama() {
+    cmake -S "$APP_HOME/llama.cpp" -B "$APP_HOME/llama.cpp/build" -DGGML_NATIVE=ON
+    cmake --build "$APP_HOME/llama.cpp/build" --config Release -j2
+}
+
+download_model() {
+    local model_path="$APP_HOME/models/$MODEL_NAME"
+    mkdir -p "$(dirname "$model_path")"
+    if [[ ! -s "$model_path" ]]; then
+        curl --fail --location --retry 3 --output "$model_path.tmp" "$MODEL_URL" &&
+            mv "$model_path.tmp" "$model_path"
+    fi
+}
+
+install_llama() {
+    local source_dir="$APP_HOME/llama.cpp"
+    local model_path="$APP_HOME/models/$MODEL_NAME"
+    local server_path="$source_dir/build/bin/llama-server"
+
+    run_step "빌드 도구 설치 및 패키지 목록 갱신" install_build_tools || return 1
+    run_step "llama.cpp 소스 준비" fetch_llama_source || return 1
+    run_step "llama.cpp와 서버 빌드" build_llama || return 1
+    run_step "Qwen2 모델 다운로드 (파일 크기가 큽니다)" download_model || return 1
+
+    zenity --info --title="설치 완료" --no-markup \
+        --text="llama.cpp와 모델 설치가 완료되었습니다.\n\n모델: $model_path\n서버 주소: http://127.0.0.1:8080"
+
+    if zenity --question --title="서버 실행" --no-markup \
+        --text="로컬 API 서버를 지금 실행할까요?\n다른 기기에는 공개하지 않고 이 PC에서만 접속하도록 설정됩니다."; then
+        nohup "$server_path" -m "$model_path" -c 2048 -t 2 --host 127.0.0.1 --port 8080 \
+            >>"$LOG_DIR/llama-server.log" 2>&1 </dev/null &
+        zenity --info --title="서버 실행" --no-markup \
+            --text="서버를 백그라운드에서 시작했습니다.\nhttp://127.0.0.1:8080\n\n로그: $LOG_DIR/llama-server.log"
+    fi
+}
+
+install_barrier() {
+    if ! command -v flatpak >/dev/null 2>&1; then
+        run_step "Flatpak 설치" pkexec bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y flatpak' || return 1
+    fi
+
+    run_step "Flathub 등록 및 Barrier 설치" bash -c \
+        'flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo && flatpak install --user --assumeyes flathub com.github.debauchee.barrier' || return 1
+
+    zenity --info --title="설치 완료" --no-markup --text="Barrier 설치가 완료되었습니다."
+    if zenity --question --title="Barrier 실행" --text="Barrier를 지금 실행할까요?"; then
+        nohup flatpak run --user com.github.debauchee.barrier >>"$LOG_DIR/barrier.log" 2>&1 </dev/null &
+    fi
+}
+
+configure_swap() {
+    local input size suffix swap_id swap_path
+    input=$(zenity --forms --title="가상 메모리 설정" \
+        --text="swap 파일 크기와 식별 이름을 지정하세요." \
+        --add-entry="크기 (예: 8G 또는 512M)" --entry-text="8G" \
+        --add-entry="이름 (영문, 숫자, - 또는 _)" --entry-text="8" \
+        --separator="|") || return 2
+
+    IFS='|' read -r size swap_id <<< "$input"
+    if [[ ! "$size" =~ ^[1-9][0-9]*[MG]$ ]]; then
+        zenity --error --title="입력 확인" --text="크기는 8G 또는 512M 형식으로 입력하세요."
+        return 1
+    fi
+    if [[ ! "$swap_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        zenity --error --title="입력 확인" --text="이름에는 영문, 숫자, 하이픈, 밑줄만 사용할 수 있습니다."
+        return 1
+    fi
+
+    swap_path="/swapfile_$swap_id"
+    if ! zenity --question --title="설정 확인" --no-markup \
+        --text="다음 swap 파일을 만들고 부팅 시 자동 활성화합니다.\n\n크기: $size\n경로: $swap_path\n\n계속할까요?"; then
+        return 2
+    fi
+
+    run_step "swap 파일 생성 및 재부팅 설정" pkexec bash -c '
+        set -e
+        size=$1
+        swap_path=$2
+        if [[ -e "$swap_path" ]]; then
+            echo "이미 존재하는 파일입니다: $swap_path" >&2
+            exit 1
+        fi
+        fallocate -l "$size" "$swap_path"
+        chmod 600 "$swap_path"
+        mkswap "$swap_path"
+        swapon "$swap_path"
+        grep -Fqx "$swap_path none swap sw 0 0" /etc/fstab || printf "%s none swap sw 0 0\n" "$swap_path" >> /etc/fstab
+    ' _ "$size" "$swap_path" || return 1
+
+    zenity --info --title="설정 완료" --no-markup \
+        --text="$swap_path ($size)가 활성화되었으며, 재부팅 후에도 유지됩니다."
+}
+
+if ! SELECTION=$(zenity --list --checklist --title="설치 항목 선택" \
+    --text="실행할 작업을 선택하세요.\n현재 커널: $CURRENT_KERNEL" \
+    --width=720 --height=420 --separator="|" \
+    --column="선택" --column="항목" --column="설명" \
+    FALSE "llama" "llama.cpp와 Qwen2 로컬 모델 설치 (대용량 다운로드)" \
+    FALSE "barrier" "Barrier 설치 (Flatpak, 사용자 계정에 설치)" \
+    FALSE "swap" "swap 파일 생성 (관리자 인증 필요, 재부팅 후에도 유지)"); then
     exit 0
 fi
 
-# =====================================
-# 3. llama 설치
-# =====================================
-
-if [[ ",$CHECK," == *",구형llama 설치,"* ]]; then
-    # CMAKE 재설치
-    apt remove -y cmake
-    apt install -y ca-certificates gpg wget
-    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc \
-      2>/dev/null | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
-    cat /etc/os-release
-
-    cd /tmp
-    wget https://github.com/Kitware/CMake/releases/download/v3.28.4/cmake-3.28.4-linux-x86_64.sh
-
-    chmod +x cmake-3.28.4-linux-x86_64.sh
-    ./cmake-3.28.4-linux-x86_64.sh --skip-license --prefix=/usr/local
-    hash -r
-    cmake --version
-
-
-    # old llama설치
-    cd /root
-    git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
-    cd llama.cpp
-
-    make clean
-    make -j2
-    ls -lh main
-
-    mkdir -p /root/models
-    cd /root/models
-
-    # 모델 설치
-    wget -O qwen2-1.5b-instruct-q4_k_m.gguf \
-    https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf
-
-    ls -lh /root/models/qwen2-1.5b-instruct-q4_k_m.gguf
-
-    # 모델 작동Test
-    cd /root/llama.cpp
-    ./llama-cli \
-      -m /root/models/qwen2-1.5b-instruct-q4_k_m.gguf \
-      -p "안녕하세요. 자기소개를 해주세요." \
-      -n 128 \
-      -t 2
-
-    # API SERVER 실행
-    cd /root/llama.cpp
-    find . -maxdepth 2 -type f \( -name "llama-server" -o -name "server" \)
-
-    cd /root/llama.cpp
-
-    ./server \
-      -m /root/models/qwen2-1.5b-instruct-q4_k_m.gguf \
-      -c 2048 \
-      -t 2 \
-      --host 0.0.0.0 \
-      --port 8080
-
-    zenity --info \
-        --title="완료" \
-        --text="llama 설치완료"
-
+if [[ -z "$SELECTION" ]]; then
+    zenity --info --title="선택된 작업 없음" --text="설치 항목을 선택하지 않았습니다."
+    exit 0
 fi
 
-# =====================================
-# 4. barrier 설치
-# =====================================
-
-if [[ ",$CHECK," == *",barrier 설치,"* ]]; then
-    sudo add-apt-repository ppa:flatpak/stable
-    sudo apt update
-    sudo apt install --only-upgrade flatpak
-    flatpak install flathub com.github.debauchee.barrier
-    flatpak run com.github.debauchee.barrier
-
-    zenity --info \
-        --title="완료" \
-        --text="barrier 설치완료"
-
+SUMMARY=""
+selection_has "llama" && SUMMARY+="• llama.cpp와 Qwen2 모델 설치\n"
+selection_has "barrier" && SUMMARY+="• Barrier 설치\n"
+selection_has "swap" && SUMMARY+="• swap 파일 설정\n"
+if ! zenity --question --title="작업 확인" --no-markup \
+    --text="다음 작업을 순서대로 진행합니다.\n\n$SUMMARY\n계속할까요?"; then
+    exit 0
 fi
 
-# =====================================
-# 5. 가상메모리 확장 및 추가 입력
-# =====================================
-
-if [[ ",$CHECK," == *",가상메모리 확장,"* ]]; then
-
-    if ! INPUT=$(zenity --forms \
-        --title="추가 설정" \
-        --text="swap가상메모리 값 추가 설정 (미 입력시 디폴트값)" \
-        --add-entry="확장할 메모리 단위(8G)" \
-        --add-entry="swapfile명(숫자)" \
-        --entry-text="8G" \
-        --entry-text="8" \
-        --separator="|"); then
-
-        exit 0
-    fi
-
-    IFS='|' read -r INPUT1 INPUT2 <<< "$INPUT"
-
-    sudo fallocate -l $INPUT1 /swapfile$INPUT2
-    sudo chmod 600 /swapfile$INPUT2
-    sudo mkswap /swapfile$INPUT2
-    sudo swapon /swapfile$INPUT2
-    free -h
-    /swapfile$INPUT2 none swap sw 0 0
-
-    zenity --info \
-        --title="완료" \
-        --text="swap 가상메모리 확장완료"
-
+if selection_has "llama"; then
+    install_llama || exit 1
+fi
+if selection_has "barrier"; then
+    install_barrier || exit 1
+fi
+if selection_has "swap"; then
+    configure_swap
+    result=$?
+    [[ $result -eq 2 ]] && exit 0
+    [[ $result -eq 0 ]] || exit "$result"
 fi
 
-# =====================================
-# 6. 최종 완료
-# =====================================
-
-zenity --info \
-    --title="작업 완료" \
-    --text="모든 작업이 완료되었습니다."
+zenity --info --title="작업 완료" --text="선택한 작업이 모두 완료되었습니다."
 

@@ -1,3 +1,7 @@
 #!/bin/bash
 APPDIR="$(dirname "$(readlink -f "$0")")"
-exec "$APPDIR/usr/bin/myprogram.sh" "$@"
+export APPDIR
+export PATH="$APPDIR/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/$(uname -m)-linux-gnu:$APPDIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec /bin/bash "$APPDIR/usr/bin/myprogram.sh" "$@"g
