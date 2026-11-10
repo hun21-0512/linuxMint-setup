@@ -50,31 +50,90 @@ selection_has() {
     grep -Fxq -- "$1" <<< "$SELECTION"
 }
 
-install_build_tools() {
-    pkexec bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git curl ca-certificates'
+install_kitware_cmake() {
+    pkexec bash -c '
+        set -e
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential git curl ca-certificates software-properties-common
+        add-apt-repository -y ppa:ubuntu-toolchain-r/test
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-11 g++-11
+    ' || return 1
+    local installer="$APP_HOME/cmake-3.28.4-linux-x86_64.sh"
+    curl --fail --location --retry 3 \
+        --output "$installer" \
+        https://github.com/Kitware/CMake/releases/download/v3.28.4/cmake-3.28.4-linux-x86_64.sh || return 1
+    pkexec bash "$installer" --skip-license --prefix=/usr/local || return 1
+    hash -r
 }
 
 fetch_llama_source() {
     local source_dir="$APP_HOME/llama.cpp"
+
     if [[ -d "$source_dir/.git" ]]; then
         git -C "$source_dir" pull --ff-only
     else
+        mkdir -p "$APP_HOME"
         git clone https://github.com/ggml-org/llama.cpp.git "$source_dir"
     fi
 }
 
 build_llama() {
-    cmake -S "$APP_HOME/llama.cpp" -B "$APP_HOME/llama.cpp/build" -DGGML_NATIVE=ON
-    cmake --build "$APP_HOME/llama.cpp/build" --config Release -j2
+    local source_dir="$APP_HOME/llama.cpp"
+    local build_dir="$source_dir/build"
+    local model_dir="$APP_HOME/models"
+
+    export CC=/usr/bin/gcc-11
+    export CXX=/usr/bin/g++-11
+    printf 'CC=%s\nCXX=%s\n' "$CC" "$CXX"
+
+    if [[ ! -x "$CC" || ! -x "$CXX" ]]; then
+        echo "Error: GCC 11 is required at $CC and $CXX" >&2
+        return 1
+    fi
+
+    rm -rf "$build_dir" || return 1
+
+    cmake -S "$source_dir" -B "$build_dir" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX=ON \
+        -DGGML_AVX2=ON \
+        -DLLAMA_BUILD_SERVER=ON || return 1
+    cmake --build "$build_dir" --config Release -j2 || return 1
+
+    if [[ ! -x "$build_dir/bin/llama-server" ]]; then
+        echo "Error: llama-server was not produced by the CMake build" >&2
+        return 1
+    fi
+
+    mkdir -p "$model_dir" || return 1
 }
 
 download_model() {
     local model_path="$APP_HOME/models/$MODEL_NAME"
-    mkdir -p "$(dirname "$model_path")"
+    local model_dir
+    model_dir="$(dirname "$model_path")"
+
+    mkdir -p "$model_dir" || return 1
+
+    # 모델 파일 다운로드
     if [[ ! -s "$model_path" ]]; then
-        curl --fail --location --retry 3 --output "$model_path.tmp" "$MODEL_URL" &&
-            mv "$model_path.tmp" "$model_path"
+        echo "Downloading model: $MODEL_NAME"
+
+        curl --fail --location --retry 3 \
+            --output "$model_path.tmp" \
+            "$MODEL_URL" &&
+            mv "$model_path.tmp" "$model_path" || {
+                rm -f "$model_path.tmp"
+                return 1
+            }
+    else
+        echo "Model already exists: $model_path"
     fi
+
+    # 다운로드 결과 확인
+    ls -lh "$model_path"
 }
 
 install_llama() {
@@ -82,20 +141,20 @@ install_llama() {
     local model_path="$APP_HOME/models/$MODEL_NAME"
     local server_path="$source_dir/build/bin/llama-server"
 
-    run_step "빌드 도구 설치 및 패키지 목록 갱신" install_build_tools || return 1
+    run_step "빌드 도구 설치 및 패키지 목록 갱신" install_kitware_cmake || return 1
     run_step "llama.cpp 소스 준비" fetch_llama_source || return 1
-    run_step "llama.cpp와 서버 빌드" build_llama || return 1
+    run_step "llama.cpp와 서버 빌드 (시간이 오래걸립니다)" build_llama || return 1
     run_step "Qwen2 모델 다운로드 (파일 크기가 큽니다)" download_model || return 1
 
     zenity --info --title="설치 완료" --no-markup \
         --text="llama.cpp와 모델 설치가 완료되었습니다.\n\n모델: $model_path\n서버 주소: http://127.0.0.1:8080"
 
     if zenity --question --title="서버 실행" --no-markup \
-        --text="로컬 API 서버를 지금 실행할까요?\n다른 기기에는 공개하지 않고 이 PC에서만 접속하도록 설정됩니다."; then
-        nohup "$server_path" -m "$model_path" -c 2048 -t 2 --host 127.0.0.1 --port 8080 \
+        --text="API 서버를 지금 실행할까요?\n모든 네트워크 인터페이스에서 수신하므로, 네트워크의 다른 기기에서도 이 PC의 IP 주소와 8080 포트로 접속할 수 있습니다."; then
+        nohup "$server_path" -m "$model_path" -c 2048 -t 2 --host 0.0.0.0 --port 8080 \
             >>"$LOG_DIR/llama-server.log" 2>&1 </dev/null &
         zenity --info --title="서버 실행" --no-markup \
-            --text="서버를 백그라운드에서 시작했습니다.\nhttp://127.0.0.1:8080\n\n로그: $LOG_DIR/llama-server.log"
+            --text="서버를 백그라운드에서 시작했습니다.\n이 PC: http://127.0.0.1:8080\n다른 기기: 이 PC의 IP 주소와 포트 8080\n\n로그: $LOG_DIR/llama-server.log"
     fi
 }
 

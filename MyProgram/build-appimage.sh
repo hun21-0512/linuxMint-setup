@@ -28,7 +28,7 @@ cp -a "$SOURCE_APPDIR" "$STAGED_APPDIR"
         --appdir "$STAGED_APPDIR" \
         --executable "$(readlink -f "$(command -v zenity)")" \
         --desktop-file "$STAGED_APPDIR/myprogram.desktop" \
-        --icon-file "$STAGED_APPDIR/usr/share/icons/hicolor/scalable/apps/myprogram.svg" \
+        --icon-file "$STAGED_APPDIR/usr/share/icons/hicolor/scalable/apps/AppStore.svg" \
         --plugin gtk \
         --output appimage
 )
